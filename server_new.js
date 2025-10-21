@@ -1,37 +1,46 @@
+const express = require('express');
+const crypto = require('crypto');
+
+const app = express();
+
+// Capture raw body for Shopify HMAC check
+app.use(express.json({
+  verify: (req, _res, buf) => { req.rawBody = buf; }
+}));
+
+app.get('/healthz', (_req, res) => res.status(200).send('ok'));
+
+console.log('[BOOT] SHOPIFY_WEBHOOK_SECRET length:',
+  (process.env.SHOPIFY_WEBHOOK_SECRET || '').trim().length,
+  'hex?', /^[0-9a-f]{64}$/i.test((process.env.SHOPIFY_WEBHOOK_SECRET || '').trim())
+);
+
 function verifyHmac(req, res, next) {
   try {
-    const secretRaw = (process.env.SHOPIFY_WEBHOOK_SECRET || '').trim();
-    const hmacHeader = (req.get('x-shopify-hmac-sha256') || '').trim();
+    const secret = (process.env.SHOPIFY_WEBHOOK_SECRET || '').trim();
+    const header = (req.get('x-shopify-hmac-sha256') || '').trim();
     const body = req.rawBody || Buffer.alloc(0);
-    const crypto = require('crypto');
+    const isHex = /^[0-9a-f]{64}$/i.test(secret);
+    const key = isHex ? Buffer.from(secret, 'hex') : Buffer.from(secret, 'utf8');
+    const digest = crypto.createHmac('sha256', key).update(body).digest('base64');
 
-    const isHex = /^[0-9a-f]{64}$/i.test(secretRaw);
-    const keyHex = isHex ? Buffer.from(secretRaw, 'hex') : null;
-    const keyUtf = Buffer.from(secretRaw, 'utf8');
-
-    const digestHex = keyHex ? crypto.createHmac('sha256', keyHex).update(body).digest('base64') : null;
-    const digestUtf = crypto.createHmac('sha256', keyUtf).update(body).digest('base64');
-
-    const matchHex = digestHex ? crypto.timingSafeEqual(Buffer.from(digestHex), Buffer.from(hmacHeader)) : false;
-    const matchUtf = crypto.timingSafeEqual(Buffer.from(digestUtf), Buffer.from(hmacHeader));
-
-    // one-time debug
-    if (!req._hmacDebugged) {
-      const mask = s => (s ? s.slice(0, 10) + '…' + s.slice(-6) : 'null');
-      console.log('[HMAC] header len:', hmacHeader.length, 'body bytes:', body.length, 'isHexSecret:', isHex);
-      console.log('[HMAC] ours(hex):', mask(digestHex), ' ours(utf8):', mask(digestUtf), ' header:', mask(hmacHeader));
-      req._hmacDebugged = true;
+    if (crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(header))) {
+      console.log('> HMAC verified OK');
+      next();
+    } else {
+      console.log('> HMAC mismatch');
+      res.status(401).send('unauthorized');
     }
-
-    if (!matchHex && !matchUtf) {
-      console.log('> HMAC mismatch'); // 401 by design for bad signatures
-      return res.status(401).send('unauthorized');
-    }
-
-    console.log('> HMAC verified OK', matchHex ? '(hex)' : '(utf8)');
-    next();
-  } catch (e) {
-    console.error('HMAC verify error', e);
-    return res.status(401).send('unauthorized');
+  } catch (err) {
+    console.error('HMAC verify error', err);
+    res.status(401).send('unauthorized');
   }
 }
+
+app.post('/webhooks/shopify/orders-paid', verifyHmac, (req, res) => {
+  console.log('> RE4 webhook hit', new Date().toISOString());
+  res.status(200).send('ok');
+});
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`RE4 Voucher MS listening on port ${PORT}`));
