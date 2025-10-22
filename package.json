@@ -1,11 +1,1 @@
-{
-  "name": "re4-voucher-ms",
-  "version": "1.0.0",
-  "description": "Shopify Orders Paid webhook -> write Bookeo code metafield",
-  "main": "server.js",
-  "type": "module",
-  "scripts": { "start": "node server.js" },
-  "dependencies": {
-    "express": "^4.19.2"
-  }
-}
+
