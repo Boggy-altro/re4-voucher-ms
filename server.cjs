@@ -1,4 +1,4 @@
-// server.cjs — hardened webhook server (CommonJS)
+// server.cjs — strict raw-body webhook handling (CommonJS)
 const express = require('express');
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
@@ -40,45 +40,48 @@ async function initDb() {
   console.log("✅ DB ready (table: orders_paid_events)");
 }
 
-// ---- Normal JSON for non-webhook routes ----
-app.use(express.json());
+// --------- IMPORTANT ORDER: NO global express.json() BEFORE WEBHOOK ---------
 
-// ---- Strict method/content guard for the webhook path ----
+// Guard: only POST + JSON allowed here (blocks browser GETs etc.)
 app.all('/webhooks/shopify/orders-paid', (req, res, next) => {
   if (req.method !== 'POST') {
     res.set('Allow', 'POST');
-    return res.status(405).send('Method Not Allowed'); // prevents browser GETs from causing errors
+    return res.status(405).send('Method Not Allowed');
   }
-  // Content-Type must be JSON; Shopify sends 'application/json'
   const ct = (req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
   if (ct !== 'application/json') {
     return res.status(415).send('Unsupported Media Type');
   }
-  return next();
+  next();
 });
 
-// ---- Use RAW body ONLY for this one route (prevents parsing issues) ----
+// Use RAW body for Shopify (MUST be before any JSON/body parser on this path)
 app.post(
   '/webhooks/shopify/orders-paid',
   bodyParser.raw({ type: 'application/json' }),
   async (req, res) => {
+    // Ensure we truly have a Buffer
+    if (!Buffer.isBuffer(req.body)) {
+      console.error('❌ Expected raw Buffer body, got', typeof req.body);
+      return res.status(400).send('Bad Request');
+    }
+
     const hmac = req.get('x-shopify-hmac-sha256');
     if (!hmac || !SHOPIFY_WEBHOOK_SECRET) {
       console.error('❌ Missing HMAC or secret');
       return res.status(401).send('Invalid signature');
     }
 
-    // Compute HMAC on raw body
+    // Compute HMAC on the raw Buffer (exact Shopify requirement)
     const digest = crypto
       .createHmac('sha256', SHOPIFY_WEBHOOK_SECRET)
-      .update(req.body) // Buffer
+      .update(req.body)
       .digest('base64');
 
     let safeEqual = false;
     try {
       safeEqual = crypto.timingSafeEqual(Buffer.from(hmac), Buffer.from(digest));
-    } catch (_) {
-      // If lengths differ, timingSafeEqual throws; treat as invalid
+    } catch {
       safeEqual = false;
     }
     if (!safeEqual) {
@@ -86,7 +89,7 @@ app.post(
       return res.status(401).send('Invalid signature');
     }
 
-    // Parse AFTER verification
+    // Parse AFTER verifying signature
     let payload = {};
     try {
       payload = JSON.parse(req.body.toString('utf8'));
@@ -96,10 +99,9 @@ app.post(
     }
 
     const orderId = String(payload?.id ?? payload?.order_id ?? '');
-
     console.log('✅ Webhook verified', { topic: 'orders/paid', id: orderId });
 
-    // Best-effort DB insert (non-blocking for Shopify)
+    // Best-effort DB insert (non-blocking)
     try {
       if (pool) {
         await pool.query(
@@ -109,26 +111,28 @@ app.post(
       }
     } catch (e) {
       console.error('DB insert error:', e.message);
-      // continue; we still ACK to Shopify
     }
 
     return res.status(200).send('ok');
   }
 );
 
-// ---- Health endpoints ----
+// (Optional) JSON parser for other routes can go AFTER the webhook
+// app.use(express.json());
+
+// Health endpoints
 app.get('/', (_req, res) => res.send('OK'));
 app.get('/health', (_req, res) => {
   res.json({ ok: true, db: !!pool, time: new Date().toISOString() });
 });
 
-// ---- Global error handler (keeps logs clean) ----
+// Global error handler
 app.use((err, _req, res, _next) => {
   console.error('Unhandled error:', err && err.stack ? err.stack : err);
   res.status(500).send('error');
 });
 
-// ---- Start ----
+// Start
 (async () => {
   try {
     await initDb();
@@ -144,7 +148,7 @@ app.use((err, _req, res, _next) => {
   }
 })();
 
-// ---- Graceful shutdown ----
+// Graceful shutdown
 process.on('SIGTERM', async () => {
   try {
     if (pool) await pool.end();
@@ -152,4 +156,3 @@ process.on('SIGTERM', async () => {
     process.exit(0);
   }
 });
-
